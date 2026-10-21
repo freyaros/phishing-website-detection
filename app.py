@@ -1,5 +1,7 @@
 import ipaddress
 import re
+import socket
+import threading
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -158,18 +160,105 @@ def load_model():
     return joblib.load(MODEL_PATH)
 
 
+@st.cache_resource
+def get_dns_lookup_lock():
+    return threading.Lock()
+
+
+def validate_hostname(hostname):
+    try:
+        ipaddress.ip_address(hostname)
+        return
+    except ValueError:
+        pass
+
+    try:
+        ascii_hostname = hostname.encode("idna").decode("ascii")
+    except UnicodeError as error:
+        raise ValueError("The hostname contains invalid international characters.") from error
+
+    normalized_hostname = ascii_hostname[:-1] if ascii_hostname.endswith(".") else ascii_hostname
+    if not normalized_hostname or len(normalized_hostname) > 253:
+        raise ValueError("The hostname length is invalid.")
+
+    labels = normalized_hostname.split(".")
+    if any(
+        len(label) > 63
+        or not re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?", label)
+        for label in labels
+    ):
+        raise ValueError("The hostname contains an invalid label.")
+
+
 def normalize_url(value):
+    if not isinstance(value, str):
+        raise ValueError("Enter a website URL as text.")
+
     value = value.strip()
+    if not value:
+        raise ValueError("Enter a URL to analyze.")
+    if any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError("The URL cannot contain spaces or control characters.")
+    if "\\" in value or re.search(r"%(?![a-fA-F0-9]{2})", value):
+        raise ValueError("The URL contains malformed characters or percent encoding.")
+
     if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", value):
+        if value.startswith("//"):
+            raise ValueError("Enter a complete website URL, not a scheme-relative URL.")
         value = "http://" + value
 
-    parsed = urlsplit(value)
+    try:
+        parsed = urlsplit(value)
+        parsed.port
+    except ValueError as error:
+        raise ValueError("The URL authority or port is malformed.") from error
+
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
-        raise ValueError("Enter a valid website URL with a hostname.")
-    if any(character.isspace() for character in value):
-        raise ValueError("The URL cannot contain spaces.")
-    parsed.port
+        raise ValueError("Enter an HTTP or HTTPS URL with a hostname.")
+    if parsed.netloc.endswith(":"):
+        raise ValueError("The URL contains an empty port.")
+
+    validate_hostname(parsed.hostname)
     return value
+
+
+def resolve_hostname(hostname, timeout_seconds=2.0):
+    try:
+        ipaddress.ip_address(hostname)
+        return {"status": "IP literal", "detail": "DNS lookup is not needed for an IP address."}
+    except ValueError:
+        pass
+
+    lookup_lock = get_dns_lookup_lock()
+    if not lookup_lock.acquire(blocking=False):
+        return {"status": "Unavailable", "detail": "A previous DNS lookup is still pending."}
+
+    completed = threading.Event()
+    result = {}
+
+    def lookup():
+        try:
+            records = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+            addresses = sorted({record[4][0] for record in records})
+            if addresses:
+                result.update(status="Resolved", detail=f"Resolved to {', '.join(addresses[:3])}")
+            else:
+                result.update(status="No DNS records", detail="The hostname returned no address records.")
+        except socket.gaierror as error:
+            if error.errno == socket.EAI_NONAME:
+                result.update(status="No DNS records", detail="The hostname did not resolve.")
+            else:
+                result.update(status="Unavailable", detail="The system DNS resolver could not complete the lookup.")
+        except OSError:
+            result.update(status="Unavailable", detail="DNS resolution is unavailable in this environment.")
+        finally:
+            lookup_lock.release()
+            completed.set()
+
+    threading.Thread(target=lookup, daemon=True).start()
+    if not completed.wait(timeout_seconds):
+        return {"status": "Timed out", "detail": f"No DNS response within {timeout_seconds:g} seconds."}
+    return result
 
 
 def get_url_indicators(url):
@@ -236,6 +325,10 @@ st.markdown(
     unsafe_allow_html=True,
 )
 with st.form("url_check"):
+    check_dns = st.checkbox(
+        "Optional DNS hostname check",
+        help="Checks DNS records only. It does not visit the website, and DNS failure does not mean a URL is phishing.",
+    )
     input_column, action_column = st.columns([5, 1.45], vertical_alignment="bottom")
     with input_column:
         url_input = st.text_input(
@@ -257,6 +350,11 @@ if submitted:
     else:
         try:
             normalized_url = normalize_url(url_input)
+            dns_result = (
+                resolve_hostname(urlsplit(normalized_url).hostname)
+                if check_dns
+                else {"status": "Not checked", "detail": "Optional DNS lookup was not requested."}
+            )
             prediction = model.predict([normalized_url])[0]
             probabilities = model.predict_proba([normalized_url])[0]
             classes = list(model.classes_)
@@ -265,6 +363,7 @@ if submitted:
                 "url": normalized_url,
                 "prediction": str(prediction),
                 "score": score,
+                "dns": dns_result,
                 "indicators": get_url_indicators(normalized_url),
             }
             st.session_state.last_result = result
@@ -274,6 +373,7 @@ if submitted:
                     "URL": normalized_url,
                     "Prediction": str(prediction),
                     "Predicted-class model score": f"{score * 100:.1f}%",
+                    "DNS status": dns_result["status"],
                 },
             )
             st.session_state.scan_history = st.session_state.scan_history[:8]
@@ -286,7 +386,7 @@ result = st.session_state.last_result
 if result:
     st.divider()
     st.subheader("Analysis result")
-    result_column, score_column = st.columns([1.5, 1])
+    result_column, score_column, dns_column = st.columns([1.5, 1, 1])
     is_phishing = result["prediction"] == "Phishing"
     with result_column:
         if is_phishing:
@@ -305,6 +405,9 @@ if result:
     with score_column:
         st.metric("Predicted-class model score", f"{result['score'] * 100:.1f}%")
         st.caption("Model probability for the predicted class; not a guarantee of safety.")
+    with dns_column:
+        st.metric("DNS status", result["dns"]["status"])
+        st.caption(result["dns"]["detail"] + " DNS status does not change the ML prediction.")
 
     st.subheader("URL indicators")
     st.markdown(
