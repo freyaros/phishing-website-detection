@@ -1,9 +1,8 @@
+import html
 import ipaddress
 import re
-import socket
-import threading
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 import joblib
 import pandas as pd
@@ -14,17 +13,23 @@ MODEL_PATH = BASE_DIR / "phishing_url_model.joblib"
 SAMPLES_PATH = BASE_DIR / "demo_samples.csv"
 SUSPICIOUS_PATTERNS = (
     "account",
+    "auth",
     "banking",
+    "billing",
     "confirm",
     "login",
     "password",
     "paypal",
+    "recover",
+    "reset",
     "secure",
+    "sign-in",
     "signin",
     "update",
     "verify",
     "webscr",
 )
+UNUSUAL_PUNCTUATION = frozenset("!$%^*_={}|;\"'<>#")
 
 st.set_page_config(
     page_title="PHISHGUARD | URL Analysis",
@@ -103,6 +108,11 @@ st.markdown(
     .result-card.legitimate strong { color: var(--pg-green); }
     .result-card span { color: var(--pg-muted); font-size: .97rem; line-height: 1.5; }
     .section-note { color: var(--pg-muted); font-size: .96rem; margin: -.25rem 0 .8rem; }
+    .pg-risk-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(205px, 1fr)); gap: .8rem; margin: .8rem 0 1rem; }
+    .pg-risk-item { min-width: 0; background: var(--pg-card); border: 1px solid var(--pg-border); border-radius: 10px; padding: .95rem 1rem; }
+    .pg-risk-item h4 { color: var(--pg-muted); font: 600 .93rem Inter, ui-sans-serif, sans-serif; margin: 0 0 .45rem; }
+    .pg-risk-value { color: var(--pg-cyan); font: 700 1.12rem "Space Grotesk", Inter, sans-serif; overflow-wrap: anywhere; margin-bottom: .35rem; }
+    .pg-risk-description { color: var(--pg-muted); font-size: .9rem; line-height: 1.45; }
     div[data-testid="stAlert"] { background: var(--pg-surface); border: 1px solid var(--pg-border); color: var(--pg-text); border-radius: 9px; }
     div[data-testid="stAlert"] p { color: var(--pg-text); }
     div[data-testid="stDataFrame"] { border: 1px solid var(--pg-border); border-radius: 9px; overflow: hidden; }
@@ -158,11 +168,6 @@ st.markdown(
 @st.cache_resource
 def load_model():
     return joblib.load(MODEL_PATH)
-
-
-@st.cache_resource
-def get_dns_lookup_lock():
-    return threading.Lock()
 
 
 def validate_hostname(hostname):
@@ -222,45 +227,6 @@ def normalize_url(value):
     return value
 
 
-def resolve_hostname(hostname, timeout_seconds=2.0):
-    try:
-        ipaddress.ip_address(hostname)
-        return {"status": "IP literal", "detail": "DNS lookup is not needed for an IP address."}
-    except ValueError:
-        pass
-
-    lookup_lock = get_dns_lookup_lock()
-    if not lookup_lock.acquire(blocking=False):
-        return {"status": "Unavailable", "detail": "A previous DNS lookup is still pending."}
-
-    completed = threading.Event()
-    result = {}
-
-    def lookup():
-        try:
-            records = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
-            addresses = sorted({record[4][0] for record in records})
-            if addresses:
-                result.update(status="Resolved", detail=f"Resolved to {', '.join(addresses[:3])}")
-            else:
-                result.update(status="No DNS records", detail="The hostname returned no address records.")
-        except socket.gaierror as error:
-            if error.errno == socket.EAI_NONAME:
-                result.update(status="No DNS records", detail="The hostname did not resolve.")
-            else:
-                result.update(status="Unavailable", detail="The system DNS resolver could not complete the lookup.")
-        except OSError:
-            result.update(status="Unavailable", detail="DNS resolution is unavailable in this environment.")
-        finally:
-            lookup_lock.release()
-            completed.set()
-
-    threading.Thread(target=lookup, daemon=True).start()
-    if not completed.wait(timeout_seconds):
-        return {"status": "Timed out", "detail": f"No DNS response within {timeout_seconds:g} seconds."}
-    return result
-
-
 def get_url_indicators(url):
     parsed = urlsplit(url)
     hostname = parsed.hostname or ""
@@ -270,17 +236,24 @@ def get_url_indicators(url):
     except ValueError:
         uses_ip = False
 
-    lowered_url = url.lower()
+    lowered_url = unquote(url).lower()
     patterns_found = [
         pattern for pattern in SUSPICIOUS_PATTERNS
         if re.search(rf"{re.escape(pattern)}", lowered_url)
     ]
+    host_labels = [label for label in hostname.rstrip(".").split(".") if label]
+    if host_labels and host_labels[0].lower() == "www":
+        host_labels = host_labels[1:]
+    subdomain_count = max(len(host_labels) - 2, 0) if not uses_ip else 0
+    unusual_punctuation = sorted({character for character in url if character in UNUSUAL_PUNCTUATION})
     return {
         "length": len(url),
         "https": parsed.scheme.lower() == "https",
         "ip": uses_ip,
+        "subdomains": subdomain_count,
         "at_symbol": "@" in url,
         "patterns": patterns_found,
+        "unusual_punctuation": unusual_punctuation,
     }
 
 
@@ -301,7 +274,7 @@ if SAMPLES_PATH.exists():
         samples = pd.read_csv(SAMPLES_PATH).dropna(subset=["url", "actual"])
         samples = samples.reset_index(drop=True)
         options = ["Enter a URL yourself"] + [
-            f"Demo {index + 1}: {row['actual']}"
+            f"Demo {index + 1}: {'Phishing' if row['actual'] == 'Phishing' else 'Legitimate'}"
             for index, row in samples.iterrows()
         ]
         choice = st.selectbox("Demonstration example", options)
@@ -325,10 +298,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 with st.form("url_check"):
-    check_dns = st.checkbox(
-        "Optional DNS hostname check",
-        help="Checks DNS records only. It does not visit the website, and DNS failure does not mean a URL is phishing.",
-    )
     input_column, action_column = st.columns([5, 1.45], vertical_alignment="bottom")
     with input_column:
         url_input = st.text_input(
@@ -350,11 +319,6 @@ if submitted:
     else:
         try:
             normalized_url = normalize_url(url_input)
-            dns_result = (
-                resolve_hostname(urlsplit(normalized_url).hostname)
-                if check_dns
-                else {"status": "Not checked", "detail": "Optional DNS lookup was not requested."}
-            )
             prediction = model.predict([normalized_url])[0]
             probabilities = model.predict_proba([normalized_url])[0]
             classes = list(model.classes_)
@@ -363,7 +327,6 @@ if submitted:
                 "url": normalized_url,
                 "prediction": str(prediction),
                 "score": score,
-                "dns": dns_result,
                 "indicators": get_url_indicators(normalized_url),
             }
             st.session_state.last_result = result
@@ -373,7 +336,6 @@ if submitted:
                     "URL": normalized_url,
                     "Prediction": str(prediction),
                     "Predicted-class model score": f"{score * 100:.1f}%",
-                    "DNS status": dns_result["status"],
                 },
             )
             st.session_state.scan_history = st.session_state.scan_history[:8]
@@ -386,7 +348,7 @@ result = st.session_state.last_result
 if result:
     st.divider()
     st.subheader("Analysis result")
-    result_column, score_column, dns_column = st.columns([1.5, 1, 1])
+    result_column, score_column = st.columns([1.5, 1])
     is_phishing = result["prediction"] == "Phishing"
     with result_column:
         if is_phishing:
@@ -405,31 +367,63 @@ if result:
     with score_column:
         st.metric("Predicted-class model score", f"{result['score'] * 100:.1f}%")
         st.caption("Model probability for the predicted class; not a guarantee of safety.")
-    with dns_column:
-        st.metric("DNS status", result["dns"]["status"])
-        st.caption(result["dns"]["detail"] + " DNS status does not change the ML prediction.")
 
-    st.subheader("URL indicators")
+    st.subheader("Explainable URL risk indicators")
     st.markdown(
-        '<p class="section-note">Simple heuristics shown separately from the trained model. '
-        'They are not proof that a URL is malicious and are not features extracted by this model.</p>',
+        '<p class="section-note">These structural observations are separate from the trained model and are not proof that a URL is malicious. Subdomain count is approximate because public-suffix rules vary.</p>',
         unsafe_allow_html=True,
     )
     indicators = result["indicators"]
-    indicator_columns = st.columns(5)
-    indicator_values = [
-        ("URL length", f"{indicators['length']} characters"),
-        ("HTTPS", "Present" if indicators["https"] else "Not present"),
-        ("IP address host", "Yes" if indicators["ip"] else "No"),
-        ("@ symbol", "Present" if indicators["at_symbol"] else "Not present"),
+    indicator_cards = [
         (
-            "Suspicious keywords",
-            ", ".join(indicators["patterns"]) if indicators["patterns"] else "None found",
+            "URL length",
+            f"{indicators['length']} characters",
+            "Long addresses can make the destination harder to spot; length alone does not indicate intent.",
+        ),
+        (
+            "Subdomains",
+            f"{indicators['subdomains']} (approx.)",
+            "Counts labels before the final two hostname labels, excluding www. Country-code suffixes can affect this estimate.",
+        ),
+        (
+            "IP address hostname",
+            "Present" if indicators["ip"] else "Not present",
+            "An IP address in place of a domain may deserve extra scrutiny, but can have legitimate uses.",
+        ),
+        (
+            "@ symbol",
+            "Present" if indicators["at_symbol"] else "Not present",
+            "An @ can make the preceding text look like the destination; it is not conclusive by itself.",
+        ),
+        (
+            "Login-related words",
+            ", ".join(indicators["patterns"]) if indicators["patterns"] else "None detected",
+            "Words like login, verify, or password can appear in legitimate URLs too.",
+        ),
+        (
+            "Unusual punctuation",
+            ", ".join(indicators["unusual_punctuation"]) if indicators["unusual_punctuation"] else "None detected",
+            "These characters can occur in valid paths or queries; this is only a structural observation.",
+        ),
+        (
+            "HTTPS scheme",
+            "Present" if indicators["https"] else "Not present",
+            "HTTPS protects the connection but does not prove that a website is legitimate.",
         ),
     ]
-    for column, (label, value) in zip(indicator_columns, indicator_values):
-        with column:
-            st.metric(label, value)
+    card_markup = []
+    for label, value, explanation in indicator_cards:
+        card_markup.append(
+            '<article class="pg-risk-item">'
+            f"<h4>{html.escape(label)}</h4>"
+            f'<div class="pg-risk-value">{html.escape(value)}</div>'
+            f'<div class="pg-risk-description">{html.escape(explanation)}</div>'
+            "</article>"
+        )
+    st.markdown(
+        '<div class="pg-risk-grid">' + "".join(card_markup) + "</div>",
+        unsafe_allow_html=True,
+    )
 
     if is_phishing:
         st.warning(
