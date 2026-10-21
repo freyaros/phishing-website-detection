@@ -1,3 +1,4 @@
+from collections import Counter
 import html
 import ipaddress
 import re
@@ -257,6 +258,101 @@ def get_url_indicators(url):
     }
 
 
+def get_model_explanation(model, url, predicted_class, max_features=24):
+    vectorizer = model.named_steps["tfidf"]
+    classifier = model.named_steps["classifier"]
+    classes = list(classifier.classes_)
+    if len(classes) != 2 or classifier.coef_.shape[0] != 1:
+        raise ValueError("This explanation helper requires a binary Logistic Regression model.")
+
+    transformed = vectorizer.transform([url]).tocsr()
+    feature_names = vectorizer.get_feature_names_out()
+    coefficients = classifier.coef_[0]
+    contributions = {
+        int(feature_index): float(tfidf_value) * float(coefficients[feature_index])
+        for feature_index, tfidf_value in zip(transformed.indices, transformed.data)
+    }
+    preprocessed_url = vectorizer.build_preprocessor()(url)
+    analyzer_counts = Counter(vectorizer.build_analyzer()(url))
+    fragments_by_class = {}
+
+    for class_name, direction in ((classes[1], 1), (classes[0], -1)):
+        strongest_features = sorted(
+            (
+                (feature_index, contribution)
+                for feature_index, contribution in contributions.items()
+                if contribution * direction > 0
+            ),
+            key=lambda item: item[1] * direction,
+            reverse=True,
+        )[:max_features]
+
+        occurrences = []
+        for feature_index, contribution in strongest_features:
+            ngram = str(feature_names[feature_index])
+            occurrence_count = analyzer_counts.get(ngram, 0)
+            if not occurrence_count:
+                continue
+
+            positions = []
+            search_from = 0
+            while True:
+                position = preprocessed_url.find(ngram, search_from)
+                if position < 0:
+                    break
+                positions.append(position)
+                search_from = position + 1
+
+            if not positions:
+                continue
+
+            per_occurrence_contribution = contribution / len(positions)
+            occurrences.extend(
+                (
+                    position,
+                    position + len(ngram),
+                    per_occurrence_contribution,
+                    ngram,
+                )
+                for position in positions
+            )
+
+        merged = []
+        for start, end, contribution, ngram in sorted(occurrences):
+            if not merged or start > merged[-1]["end"]:
+                merged.append(
+                    {
+                        "start": start,
+                        "end": end,
+                        "contribution": contribution,
+                        "ngrams": {ngram},
+                    }
+                )
+            else:
+                merged[-1]["end"] = max(merged[-1]["end"], end)
+                merged[-1]["contribution"] += contribution
+                merged[-1]["ngrams"].add(ngram)
+
+        merged.sort(key=lambda fragment: abs(fragment["contribution"]), reverse=True)
+        fragments_by_class[class_name] = [
+            {
+                "URL fragment": preprocessed_url[item["start"]:item["end"]],
+                "Log-odds contribution": round(item["contribution"], 4),
+                "N-grams combined": len(item["ngrams"]),
+            }
+            for item in merged[:5]
+        ]
+
+    return {
+        "classes": classes,
+        "predicted_class": predicted_class,
+        "active_feature_count": int(transformed.nnz),
+        "fragments_by_class": fragments_by_class,
+        "decision_margin": float(classifier.decision_function(transformed)[0]),
+        "reconstructed_margin": float(sum(contributions.values()) + classifier.intercept_[0]),
+    }
+
+
 try:
     model = load_model()
 except Exception:
@@ -367,6 +463,63 @@ if result:
     with score_column:
         st.metric("Predicted-class model score", f"{result['score'] * 100:.1f}%")
         st.caption("Model probability for the predicted class; not a guarantee of safety.")
+
+    st.subheader("Why this prediction?")
+    st.caption(
+        "These are signed contributions from active character n-grams in the existing TF-IDF + Logistic Regression model. "
+        "They explain learned associations, not definitive causes or proof of intent."
+    )
+    try:
+        model_explanation = get_model_explanation(
+            model,
+            result["url"],
+            result["prediction"],
+        )
+    except Exception:
+        model_explanation = None
+
+    if model_explanation is None:
+        st.info("A model explanation could not be computed for this result; the prediction is unchanged.")
+    elif model_explanation["active_feature_count"] == 0:
+        st.info(
+            "No learned character n-grams were active for this URL. "
+            "The model result may primarily reflect its baseline term."
+        )
+    else:
+        st.caption(
+            f"The vectorizer activated {model_explanation['active_feature_count']} learned n-grams. "
+            f"Positive contributions point toward {model_explanation['classes'][1]}; "
+            f"negative contributions point toward {model_explanation['classes'][0]}. "
+            "Contributions are shown in Logistic Regression log-odds units, not as probabilities."
+        )
+        phishing_class = next(
+            class_name for class_name in model_explanation["classes"]
+            if class_name == "Phishing"
+        )
+        legitimate_class = next(
+            class_name for class_name in model_explanation["classes"]
+            if class_name == "Legitimate"
+        )
+        phishing_column, legitimate_column = st.columns(2)
+        for column, class_name in (
+            (phishing_column, phishing_class),
+            (legitimate_column, legitimate_class),
+        ):
+            supports_prediction = class_name == result["prediction"]
+            with column:
+                st.markdown(
+                    f"**Toward {html.escape(class_name)}** "
+                    f"({'supports' if supports_prediction else 'opposes'} this prediction)"
+                )
+                fragments = model_explanation["fragments_by_class"][class_name]
+                if fragments:
+                    st.dataframe(
+                        pd.DataFrame(fragments),
+                        hide_index=True,
+                        width="stretch",
+                    )
+                else:
+                    st.caption(f"No active n-gram contributions toward {class_name} for this URL.")
 
     st.subheader("Explainable URL risk indicators")
     st.markdown(
